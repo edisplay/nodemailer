@@ -17,6 +17,10 @@ const GREETING_TIMEOUT = 30 * 1000; // how much to wait after connection is esta
 const DNS_TIMEOUT = 30 * 1000; // how much to wait for resolveHostname
 const TEARDOWN_NOOP = () => {}; // reusable no-op handler for absorbing errors during socket teardown
 
+// how many bytes a single server response may occupy while it is still being received.
+// Generous compared to any real reply, it only stops a peer that never completes one
+const MAX_RESPONSE_SIZE = 1024 * 1024;
+
 /**
  * Custom authentication handlers keyed by (case insensitive) SASL method name
  */
@@ -52,6 +56,8 @@ export interface SMTPConnectionOptions {
     greetingTimeout?: number | undefined;
     /** Time of inactivity in ms until the connection is closed, defaults to 10 minutes */
     socketTimeout?: number | undefined;
+    /** Largest single server response to accept in bytes, defaults to 1 MB */
+    maxResponseSize?: number | undefined;
     /** Time to wait in ms for the DNS requests to be resolved, defaults to 30 seconds */
     dnsTimeout?: number | undefined;
     /** Use LMTP instead of SMTP */
@@ -307,11 +313,20 @@ function decodeServerResponse(str: string): string {
  * Called with the byte-container form the queue holds (see _onData): the check only looks
  * at leading ASCII digits and '-' of the last line, and a UTF-8 continuation byte is never
  * 0x0A, so line boundaries and the tested prefix are the same before and after decoding.
- * The last line is read with lastIndexOf rather than split() because a queue entry grows
- * with every chunk appended to it and only its final line matters.
+ * The last line is read with lastIndexOf rather than split() because a queue entry may hold
+ * a whole multiline reply and only its final line matters.
  */
 function isPartialResponse(str: string): boolean {
-    return /^\d+-/.test(str.slice(str.lastIndexOf('\n') + 1));
+    return isPartialLine(str.slice(str.lastIndexOf('\n') + 1));
+}
+
+/**
+ * True when a single reply line is a continuation ("250-..."). Used where the line is
+ * already known to be one line, which skips the scan isPartialResponse needs to find the
+ * last line of a whole reply.
+ */
+function isPartialLine(line: string): boolean {
+    return /^\d+-/.test(line);
 }
 
 /**
@@ -329,6 +344,7 @@ function isPartialResponse(str: string): boolean {
  *  * **greetingTimeout** - Time to wait in ms until greeting message is received from the server (defaults to 30 seconds)
  *  * **connectionTimeout** - how many milliseconds to wait for the connection to establish (defaults to 2 minutes)
  *  * **socketTimeout** - Time of inactivity until the connection is closed (defaults to 10 minutes)
+ *  * **maxResponseSize** - Largest single server response to accept in bytes (defaults to 1 MB)
  *  * **dnsTimeout** - Time to wait in ms for the DNS requests to be resolved (defaults to 30 seconds)
  *  * **lmtp** - if true, uses LMTP instead of SMTP protocol
  *  * **logger** - bunyan compatible logger interface
@@ -389,6 +405,13 @@ class SMTPConnection extends EventEmitter {
      * @internal
      */
     _responseQueue: string[];
+
+    /**
+     * True while the last entry of _responseQueue is a partial reply that is still
+     * being assembled from continuation lines
+     * @internal
+     */
+    _responsePartial: boolean;
 
     lastServerResponse: string | false;
 
@@ -590,6 +613,8 @@ class SMTPConnection extends EventEmitter {
         this._remainder = '';
 
         this._responseQueue = [];
+
+        this._responsePartial = false;
 
         this.lastServerResponse = false;
 
@@ -1273,31 +1298,66 @@ class SMTPConnection extends EventEmitter {
             return;
         }
 
-        let data = chunk.toString('binary');
-        let lines = (this._remainder + data).split(/\r?\n/);
-        let lastline: string;
+        const maxResponseSize = this.options.maxResponseSize || MAX_RESPONSE_SIZE;
+        const data = chunk.toString('binary');
+
+        // A chunk without a line break only extends the line currently being received, so
+        // keep it in the remainder and leave that string unflattened. Splitting the whole
+        // remainder again on every chunk would rescan everything buffered for that line so
+        // far, which is quadratic in the length of a line the peer never terminates
+        if (!data.includes('\n')) {
+            this._remainder += data;
+            if (this._remainder.length > maxResponseSize) {
+                return this._onResponseTooLarge();
+            }
+            return;
+        }
+
+        const lines = (this._remainder + data).split(/\r?\n/);
 
         this._remainder = lines.pop() as string;
 
         for (let i = 0, len = lines.length; i < len; i++) {
-            if (this._responseQueue.length) {
-                lastline = this._responseQueue[this._responseQueue.length - 1];
-                if (isPartialResponse(lastline)) {
-                    this._responseQueue[this._responseQueue.length - 1] += '\n' + lines[i];
-                    continue;
-                }
+            if (this._responsePartial) {
+                this._responseQueue[this._responseQueue.length - 1] += '\n' + lines[i];
+            } else {
+                this._responseQueue.push(lines[i]);
             }
-            this._responseQueue.push(lines[i]);
+
+            // The line just added is the last line of that queue entry, so it alone decides
+            // whether the reply is still partial. Looking for the last line of the accumulated
+            // entry instead would rescan a string that grows with every continuation line,
+            // which is quadratic in the size of the reply
+            this._responsePartial = isPartialLine(lines[i]);
+
+            // Checked as each line lands, so a peer that never completes a reply cannot keep
+            // buffering, and the limit does not depend on how it split its bytes into chunks
+            if (this._responsePartial && this._responseQueue[this._responseQueue.length - 1].length > maxResponseSize) {
+                return this._onResponseTooLarge();
+            }
         }
 
-        if (this._responseQueue.length) {
-            lastline = this._responseQueue[this._responseQueue.length - 1];
-            if (isPartialResponse(lastline)) {
-                return;
-            }
+        if (this._remainder.length > maxResponseSize) {
+            return this._onResponseTooLarge();
+        }
+
+        if (this._responsePartial) {
+            return;
         }
 
         this._processResponse();
+    }
+
+    /**
+     * Drops a connection whose peer keeps extending a reply it never completes, releasing
+     * whatever was buffered for that reply
+     * @internal
+     */
+    _onResponseTooLarge(): void {
+        this._remainder = '';
+        this._responseQueue = [];
+        this._responsePartial = false;
+        this._onError(new Error('Server response exceeds maximum allowed size'), 'EPROTOCOL', false, 'CONN');
     }
 
     /**
@@ -1462,6 +1522,7 @@ class SMTPConnection extends EventEmitter {
         // part of the secured EHLO capabilities). STARTTLS response injection.
         this._remainder = '';
         this._responseQueue = [];
+        this._responsePartial = false;
 
         // do not remove all listeners or it breaks node v0.10 as there's
         // apparently a 'finish' event set that would be cleared as well
